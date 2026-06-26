@@ -147,9 +147,14 @@ func handleWs(uiPass string, clients *ClientsStruct) func(w http.ResponseWriter,
 
 		go func(clientId string) {
 			for {
-				time.Sleep(1 * time.Second)
-				if ch.cursorStatus == CURSOR_STOPPED {
-					bts, err = json.Marshal(models.ClientMsgStatus{
+				select {
+				case <-ch.done:
+					return
+				case <-time.After(1 * time.Second):
+				}
+
+				if ch.getCursorStatus() == CURSOR_STOPPED {
+					bts, err := json.Marshal(models.ClientMsgStatus{
 						BaseMessage: models.BaseMessage{
 							MessageType: models.MessageTypeClientMsgStatus,
 						},
@@ -177,7 +182,13 @@ func handleWs(uiPass string, clients *ClientsStruct) func(w http.ResponseWriter,
 		}(clientId)
 
 		for {
-			msgs := <-ch.ch
+			var msgs []models.Message
+			select {
+			case <-ch.done:
+				return
+			case msgs = <-ch.ch:
+			}
+
 			bulk := models.MessageBulk{
 				BaseMessage: models.BaseMessage{
 					MessageType: models.MessageTypeLogBulk,

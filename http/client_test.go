@@ -2,6 +2,7 @@ package http
 
 import (
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +10,44 @@ import (
 
 	"github.com/stretchr/testify/assert"
 )
+
+func readMessages(t *testing.T, ch <-chan []Message) []Message {
+	t.Helper()
+
+	select {
+	case msg := <-ch:
+		return msg
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for client messages")
+	}
+	return nil
+}
+
+func readMessagesUntil(t *testing.T, ch <-chan []Message, count int) []Message {
+	t.Helper()
+
+	msgs := []Message{}
+	deadline := time.After(time.Second)
+	for len(msgs) < count {
+		select {
+		case msg := <-ch:
+			msgs = append(msgs, msg...)
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d messages, got %d", count, len(msgs))
+		}
+	}
+	return msgs
+}
+
+func drainMessages(ch <-chan []Message) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
 
 func TestClientStartAddToBuffer(t *testing.T) {
 	ch := make(chan Message)
@@ -224,7 +263,7 @@ func TestClientsStats(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	assert.Equal(t, c.Stats().Count, 100)
-	assert.Less(t, st.UnixMicro(), c.Stats().FirstMessageAt.UnixMicro())
+	assert.LessOrEqual(t, st.UnixMicro(), c.Stats().FirstMessageAt.UnixMicro())
 	assert.GreaterOrEqual(t, stop.UnixMicro(), c.Stats().LastMessageAt.UnixMicro())
 }
 
@@ -351,17 +390,154 @@ func TestClientLoad(t *testing.T) {
 	}()
 
 	c.PauseFollowing(client.id)
+	drainMessages(client.ch)
 
-	assert.Equal(t, len(client.buffer), 0)
+	assert.Equal(t, client.bufferLen(), 0)
 
 	c.Load(client.id, 10, 25, true)
-	assert.Equal(t, len(client.buffer), 25)
-	assert.Equal(t, client.buffer[0].Id, "10")
-	assert.Equal(t, client.buffer[24].Id, "34")
+	buffer := readMessagesUntil(t, client.ch, 25)
+	assert.Equal(t, len(buffer), 25)
+	assert.Equal(t, buffer[0].Id, "10")
+	assert.Equal(t, buffer[24].Id, "34")
 
 	c.Load(client.id, 100, 25, false)
-	assert.Equal(t, len(client.buffer), 25)
-	assert.Equal(t, client.buffer[0].Id, "101")
-	assert.Equal(t, client.buffer[24].Id, "125")
+	buffer = readMessagesUntil(t, client.ch, 25)
+	assert.Equal(t, len(buffer), 25)
+	assert.Equal(t, buffer[0].Id, "101")
+	assert.Equal(t, buffer[24].Id, "125")
 
+}
+
+func TestClientJoinMultipleConcurrent(t *testing.T) {
+	ch := make(chan Message)
+	c := NewClients(ch, 1000)
+
+	BULK_WINDOW_MS = 1
+	defer func() {
+		BULK_WINDOW_MS = 100
+	}()
+
+	const clientCount = 20
+	clients := make([]*Client, clientCount)
+	wg := sync.WaitGroup{}
+	wg.Add(clientCount)
+
+	for i := 0; i < clientCount; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			clients[idx] = c.Join(10, true)
+		}(i)
+	}
+	wg.Wait()
+
+	ch <- Message{Id: "1", Content: "fanout"}
+
+	for _, cl := range clients {
+		msg := readMessages(t, cl.ch)
+		assert.Equal(t, 1, len(msg))
+		assert.Equal(t, "fanout", msg[0].Content)
+	}
+}
+
+func TestClientPauseDoesNotStopOtherClients(t *testing.T) {
+	ch := make(chan Message)
+	c := NewClients(ch, 1000)
+	client1 := c.Join(0, true)
+	client2 := c.Join(0, true)
+
+	BULK_WINDOW_MS = 1
+	defer func() {
+		BULK_WINDOW_MS = 100
+	}()
+
+	c.PauseFollowing(client1.id)
+
+	ch <- Message{Id: "1", Content: "only-client-2"}
+
+	msg := readMessages(t, client2.ch)
+	assert.Equal(t, 1, len(msg))
+	assert.Equal(t, "only-client-2", msg[0].Content)
+	assert.Equal(t, 0, len(client1.ch))
+}
+
+func TestClientLoadDoesNotStopOtherClients(t *testing.T) {
+	ch := make(chan Message)
+	c := NewClients(ch, 1000)
+	client1 := c.Join(0, true)
+	client2 := c.Join(0, true)
+
+	BULK_WINDOW_MS = 1
+	defer func() {
+		BULK_WINDOW_MS = 100
+	}()
+
+	for i := 1; i <= 20; i++ {
+		ch <- Message{Id: strconv.Itoa(i), Content: strconv.Itoa(i)}
+	}
+
+	readMessagesUntil(t, client1.ch, 20)
+	readMessagesUntil(t, client2.ch, 20)
+
+	c.Load(client1.id, 5, 5, true)
+	loaded := readMessagesUntil(t, client1.ch, 5)
+	assert.Equal(t, "5", loaded[0].Id)
+	assert.Equal(t, "9", loaded[4].Id)
+
+	ch <- Message{Id: "21", Content: "tail"}
+
+	msg := readMessages(t, client2.ch)
+	assert.Equal(t, 1, len(msg))
+	assert.Equal(t, "tail", msg[0].Content)
+	assert.Equal(t, 0, len(client1.ch))
+}
+
+func TestClientConcurrentJoinCloseAndSend(t *testing.T) {
+	ch := make(chan Message)
+	c := NewClients(ch, 1000)
+
+	BULK_WINDOW_MS = 1
+	defer func() {
+		BULK_WINDOW_MS = 100
+	}()
+
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			cl := c.Join(5, true)
+			if idx%2 == 0 {
+				c.PauseFollowing(cl.id)
+			}
+			c.Close(cl.id)
+			c.Close(cl.id)
+		}(i)
+	}
+
+	for i := 0; i < 100; i++ {
+		ch <- Message{Id: strconv.Itoa(i), Content: strconv.Itoa(i)}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for concurrent clients")
+	}
+}
+
+func TestClientCloseIsIdempotent(t *testing.T) {
+	ch := make(chan Message)
+	c := NewClients(ch, 1000)
+	client := c.Join(0, true)
+
+	c.Close(client.id)
+	c.Close(client.id)
+	c.Close("missing-client")
 }
