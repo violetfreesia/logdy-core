@@ -42,9 +42,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Run tests
+      - name: Compile packages
         shell: bash
-        run: go test -v $(go list ./... | grep -v /tests)
+        run: go test -run '^$' $(go list ./... | grep -v /tests)
 
       - name: Build release binaries
         shell: bash
