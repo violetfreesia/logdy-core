@@ -81,18 +81,18 @@ jobs:
       - name: Package release artifacts
         shell: bash
         run: |
-          mkdir -p release
+          mkdir -p release-artifacts
           for binary in dist/logdy_*; do
             name="$(basename "${binary}")"
             if [[ "${name}" == *.exe ]]; then
               base="${name%.exe}"
-              zip -j "release/${base}.zip" "${binary}"
+              zip -j "release-artifacts/${base}.zip" "${binary}"
             else
-              tar -C dist -czf "release/${name}.tar.gz" "${name}"
+              tar -C dist -czf "release-artifacts/${name}.tar.gz" "${name}"
             fi
           done
 
-          cd release
+          cd release-artifacts
           sha256sum * > checksums.txt
 
       - name: Publish GitHub release
@@ -103,4 +103,4 @@ jobs:
           name: Logdy Core ${{ env.version }}
           body: |
             Automated release for `${{ github.sha }}` from the `main` branch.
-          files: release/*
+          files: release-artifacts/*
