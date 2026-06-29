@@ -34,7 +34,7 @@ jobs:
       - name: Prepare release version
         shell: bash
         run: |
-          version="0.0.${GITHUB_RUN_NUMBER}"
+          version="1.0.${GITHUB_RUN_NUMBER}"
           short_sha="${GITHUB_SHA::7}"
           echo "version=${version}" >> "${GITHUB_ENV}"
           echo "tag_name=main-${GITHUB_RUN_NUMBER}-${short_sha}" >> "${GITHUB_ENV}"
